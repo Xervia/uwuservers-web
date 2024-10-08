@@ -4,6 +4,7 @@ from result import result, error, checkJson
 from hashlib import new, sha512, sha256
 from datetime import date, datetime
 from ipRatelimit import ratelimit
+from moderation import Moderation
 from analytics import Analytics
 from backupApi import Backup
 from threads import Threads
@@ -20,13 +21,14 @@ class PERMISSIONS:
     GUEST = 0
     MODERATOR = 1
     ADMIN = 2
-    
+
+
 class ViolationDangerZones:
     GOOD = 0
     OKAY = 1
-    BAD = 2
-    DANGER = 3
-    BANNED = 4
+    DANGER = 2
+    BANNED = 3
+    DELETED = 4
 
 
 print("API v1 loaded")
@@ -48,51 +50,58 @@ class Api:
         self.mcAuth = mcAuth()
         self.backup = Backup()
         self.analytics = Analytics()
-        
+        self.moderation = Moderation(self)
+
         # Login/Register user with uuid and name/password
         @app.route(self.get_uri("login"), methods=["POST"])
         def login():
             def _():
-                data = checkJson([[{"value": "uuid", "type": str}, {"value": "password", "type": str}], [{"value": "mc_auth", "type": dict}]])
+                data = checkJson([[{"value": "uuid", "type": str}, {
+                                 "value": "password", "type": str}], [{"value": "mc_auth", "type": dict}]])
                 if 'error' in data:
                     return error(data['error'])
-                
+
                 name = None
-                
+
                 if 'mc_auth' in data:
                     mc_auth_data = self.mcAuth.proxy(data['mc_auth'])
                     if 'error' in mc_auth_data:
                         return error(mc_auth_data['error'], mc_auth_data['status'])
-                
+
                     name = self.checkMcAuth(mc_auth_data)
                     if 'error' in name:
                         return error(name['error'], 400)
-                    
+
                     data['uuid'] = mc_auth_data['uuid']
                 else:
                     name = self.checkUUIDAndFetchName(data['uuid'])
                     if 'error' in name:
                         return error(name['error'], 400)
-                
+
                 newbie = False
+                
                 if not self.userExists(data['uuid']):
-                    registeredUser = self.register_user(data['uuid'], name)
+                    registeredUser = self.register_user(data['uuid'], name, isDemo)
                     data['password'] = registeredUser['credentials']['password']
                     registeredUser['credentials']['password'] = sha512(registeredUser['credentials']['password'].encode()).hexdigest()
                     self.update_credentials(registeredUser['credentials'])
                     self.analytics.increment('registration_per_day')
                     newbie = True
+                
+                user = self.getUserByUUID(data['uuid'])
+                if self.moderation.isUserDeleted(user['uuid']):
+                    return error('user_does_not_exist', 403)
                     
                 if 'password' not in data:
                     return result(data['uuid'], 200)
                 
                 uuid, password = data['uuid'], data['password']
                 data = self.login(uuid, password)
+                
                 if data is None:
                     return error('invalid_credentials', 401)
                 
                 self.data['credentials'][uuid]['password'] = sha512(password.encode()).hexdigest()
-                
                 self.analytics.increment('actions_per_day')
                 self.analytics.increment('login_per_day')
                 
@@ -100,22 +109,54 @@ class Api:
                     "newbie": newbie,
                     "data": data,
                 }
-
+                
                 return result(res, 200)
             return self.ratelimit.request(_)
 
-        # Get analytics
+        # Get analytics (only admin)
         @app.route(self.get_uri("analytics"), methods=["GET"])
         def getAnalytics():
             def _():
+                token = request.headers.get("Authorization")
+                if not token:
+                    return error('no_token_provided', 401)
+                
+                user = self.getUserByToken(token)
+                if 'error' in user:
+                    return error(user['error'], 401)
+                
+                if not self.checkPermissions(user, user, [PERMISSIONS.ADMIN]):
+                    return error('unauthorized', 403)
+                
+                if self.moderation.isUserBanned(user['uuid']):
+                    return error('user_banned', 403)
+                if self.moderation.isUserDeleted(user['uuid']):
+                    return error('user_deleted', 403)
+                
                 self.analytics.check()
                 return result(self.analytics.get(), 200)
             return self.ratelimit.request(_)
 
-        # Get analytics by key
+        # Get analytics by key()
         @app.route(self.get_uri("analytics/<key>"), methods=["GET"])
         def getAnalyticsByKey(key):
             def _():
+                token = request.headers.get("Authorization")
+                if not token:
+                    return error('no_token_provided', 401)
+                
+                user = self.getUserByToken(token)
+                if 'error' in user:
+                    return error(user['error'], 401)
+                
+                if not self.checkPermissions(user, user, [PERMISSIONS.ADMIN]):
+                    return error('unauthorized', 403)
+                
+                if self.moderation.isUserBanned(user['uuid']):
+                    return error('user_banned', 403)
+                if self.moderation.isUserDeleted(user['uuid']):
+                    return error('user_deleted', 403)
+                
                 self.analytics.check()
 
                 if key not in self.analytics.get()["data"].keys():
@@ -131,7 +172,13 @@ class Api:
                 if not self.userExists(uuid):
                     return error('user_not_found', 404)
                 
-                return result(self.data["users"][uuid], 200)
+                user = self.getUserByUUID(uuid)
+                if self.moderation.isUserBanned(uuid):
+                    return error('user_banned', 403)
+                if self.moderation.isUserDeleted(uuid):
+                    return error('user_deleted', 403)
+
+                return result(user, 200)
             return self.ratelimit.request(_)
 
         # Get user permissions by UUID
@@ -140,8 +187,14 @@ class Api:
             def _():
                 if not self.userExists(uuid):
                     return error('user_not_found', 404)
+                
+                user = self.getUserByUUID(uuid)
+                if self.moderation.isUserBanned(uuid):
+                    return error('user_banned', 403)
+                if self.moderation.isUserDeleted(uuid):
+                    return error('user_deleted', 403)
 
-                return result(self.data["users"][uuid]["permissions"], 200)
+                return result(user["permissions"], 200)
             return self.ratelimit.request(_)
 
         # Check user permission by UUID
@@ -150,25 +203,86 @@ class Api:
             def _():
                 if not self.userExists(uuid):
                     return error('user_not_found', 404)
+                
+                user = self.getUserByUUID(uuid)
+                if self.moderation.isUserBanned(uuid):
+                    return error('user_banned', 403)
+                if self.moderation.isUserDeleted(uuid):
+                    return error('user_deleted', 403)
 
-                return result(int(permission) in self.data["users"][uuid]["permissions"], 200)
+                return result(int(permission) in user["permissions"], 200)
             return self.ratelimit.request(_)
 
         # Get user name by UUID
         @app.route(self.get_uri("user/<uuid>/name"), methods=["GET"])
         def getUserName(uuid):
             def _():
-                name = self.checkUUIDAndFetchName(uuid)
+                if not self.userExists(uuid):
+                    return error('user_not_found', 404)
+                
+                user = self.getUserByUUID(uuid)
+                if self.moderation.isUserBanned(uuid):
+                    return error('user_banned', 403)
+                if self.moderation.isUserDeleted(uuid):
+                    return error('user_deleted', 403)
 
-                if 'error' in name:
-                    return error(name['error'], 400)
-
-                return result(name, 200)
+                return result(user['name'], 200)
             return self.ratelimit.request(_)
 
         # Delete user by token
         @app.route(self.get_uri("user/<uuid>"), methods=["DELETE"])
         def deleteUser(uuid):
+            def _():
+                data = checkJson([[{"value": "reason", "type": str}]])
+                if 'error' in data:
+                    data = {"reason": "Unknown"}
+                
+                token = request.headers.get("Authorization")
+                if not token:
+                    return error('no_token_provided', 401)
+
+                if not self.userExists(uuid):
+                    return error('user_not_found', 404)
+
+                user = self.getUserByToken(token)
+                if 'error' in user:
+                    return error(user['error'], 401)
+                
+                if self.moderation.isUserBanned(user['uuid']):
+                    return error('user_banned', 403)
+                if self.moderation.isUserDeleted(user['uuid']):
+                    return error('user_deleted', 403)
+
+                target = self.getUserByUUID(uuid)
+                if not self.checkPermissions(user, target, [PERMISSIONS.ADMIN]):
+                    return error('unauthorized', 403)
+
+                requests.delete(f"{self.cdn_uri}server/{uuid}", headers={ "Authorization": token })
+                res = self.moderation.deleteUser(user['uuid'], uuid, data['reason'])
+                if res: return error(res, 400)
+                target['permissions'] = [PERMISSIONS.GUEST]
+                self.update_user(user)
+
+                if user['uuid'] != uuid:
+                    self.append_action(uuid, "delete_user", {
+                        "by": user["uuid"],
+                        "ip": request.remote_addr,
+                    })
+                self.append_action(user["uuid"], "delete_user", {
+                    "of": uuid,
+                    "ip": request.remote_addr,
+                })
+
+                self.analytics.increment("actions_per_day")
+                self.analytics.increment("delete_user_per_day")
+                self.save_db()
+
+                return result("User deleted: " + uuid, 200)
+            return self.ratelimit.request(_)
+        
+        # Recover user by uuid (only admin)
+        @app.route(self.get_uri("user/<uuid>/recover"), methods=["POST"])
+        def recoverUser(uuid):
             def _():
                 token = request.headers.get("Authorization")
                 if not token:
@@ -177,34 +291,130 @@ class Api:
                 if not self.userExists(uuid):
                     return error('user_not_found', 404)
 
-                tokenUser = self.getUserByToken(token)
-                if 'error' in tokenUser:
-                    return error(tokenUser['error'], 401)
+                user = self.getUserByToken(token)
+                if 'error' in user:
+                    return error(user['error'], 401)
 
-                uuidUser = getUserByUUID(uuid)
-                if not self.checkPermissions(tokenUser, uuidUser, [PERMISSIONS.ADMIN]):
+                target = self.getUserByUUID(uuid)
+                if not self.checkPermissions(user, target, [PERMISSIONS.ADMIN]):
                     return error('unauthorized', 403)
 
-                requests.delete(f"{self.cdn_uri}server/{uuid}")
+                res = self.moderation.recoverUser(user['uuid'], uuid)
+                if res: return error(res, 400)
+                self.update_user(user)
 
-                if tokenUser['uuid'] != uuid:
-                    self.append_action(uuid, "delete_user", {
-                        "by": tokenUser["uuid"],
+                if user['uuid'] != uuid:
+                    self.append_action(uuid, "recover_user", {
+                        "by": user["uuid"],
                         "ip": request.remote_addr,
                     })
-                self.append_action(tokenUser["uuid"], "delete_user", {
+                self.append_action(user["uuid"], "recover_user", {
                     "of": uuid,
                     "ip": request.remote_addr,
                 })
 
-                self.data["users"][uuid]["deleted"] = True
-                self.data["users"][uuid]["deletedTimestamp"] = datetime.now().timestamp()
+                self.analytics.increment("actions_per_day")
+                self.analytics.increment("recover_user_per_day")
+                self.save_db()
+
+                return result("User recovered: " + uuid, 200)
+            return self.ratelimit.request(_)
+        
+        # Ban user by uuid (only admin and moderator)
+        @app.route(self.get_uri("user/<uuid>/ban"), methods=["POST"])
+        def banUser(uuid):
+            def _():
+                data = checkJson([[{"value": "reason", "type": str}]])
+                if 'error' in data:
+                    data = {"reason": "Unknown"}
+                
+                token = request.headers.get("Authorization")
+                if not token:
+                    return error('no_token_provided', 401)
+
+                if not self.userExists(uuid):
+                    return error('user_not_found', 404)
+
+                user = self.getUserByToken(token)
+                if 'error' in user:
+                    return error(user['error'], 401)
+                
+                if self.moderation.isUserBanned(user['uuid']):
+                    return error('user_banned', 403)
+                if self.moderation.isUserDeleted(user['uuid']):
+                    return error('user_deleted', 403)
+
+                target = self.getUserByUUID(uuid)
+                if not self.checkPermissions(user, target, [PERMISSIONS.ADMIN, PERMISSIONS.MODERATOR]):
+                    return error('unauthorized', 403)
+
+                res = self.moderation.banUser(user['uuid'], uuid, data['reason'])
+                if res: return error(res, 400)
+                target['permissions'] = [PERMISSIONS.GUEST]
+                self.update_user(user)
+
+                if user['uuid'] != uuid:
+                    self.append_action(uuid, "ban_user", {
+                        "by": user["uuid"],
+                        "reason": data["reason"],
+                        "ip": request.remote_addr,
+                    })
+                self.append_action(user["uuid"], "ban_user", {
+                    "of": uuid,
+                    "reason": data["reason"],
+                    "ip": request.remote_addr,
+                })
 
                 self.analytics.increment("actions_per_day")
-                self.analytics.increment("delete_user_per_day")
+                self.analytics.increment("banned_user_per_day")
                 self.save_db()
+
+                return result("User banned: " + uuid, 200)
+            return self.ratelimit.request(_)
+        
+        # Unban user by uuid (only admin)
+        @app.route(self.get_uri("user/<uuid>/unban"), methods=["POST"])
+        def unbanUser(uuid):
+            def _():
+                token = request.headers.get("Authorization")
+                if not token:
+                    return error('no_token_provided', 401)
+
+                if not self.userExists(uuid):
+                    return error('user_not_found', 404)
+
+                user = self.getUserByToken(token)
+                if 'error' in user:
+                    return error(user['error'], 401)
                 
-                return result("User deleted: " + uuid, 200)
+                if self.moderation.isUserBanned(user['uuid']):
+                    return error('user_banned', 403)
+                if self.moderation.isUserDeleted(user['uuid']):
+                    return error('user_deleted', 403)
+
+                target = self.getUserByUUID(uuid)
+                if not self.checkPermissions(user, target, [PERMISSIONS.ADMIN]):
+                    return error('unauthorized', 403)
+
+                res = self.moderation.unbanUser(user['uuid'], uuid)
+                if res: return error(res, 400)
+                self.update_user(user)
+
+                if user['uuid'] != uuid:
+                    self.append_action(uuid, "unban_user", {
+                        "by": user["uuid"],
+                        "ip": request.remote_addr,
+                    })
+                self.append_action(user["uuid"], "unban_user", {
+                    "of": uuid,
+                    "ip": request.remote_addr,
+                })
+
+                self.analytics.increment("actions_per_day")
+                self.analytics.increment("unbanned_user_per_day")
+                self.save_db()
+
+                return result("User unbanned: " + uuid, 200)
             return self.ratelimit.request(_)
 
         # Get user credentials by token
@@ -218,13 +428,23 @@ class Api:
                 if not self.userExists(uuid):
                     return error('user_not_found', 404)
 
-                tokenUser = self.getUserByToken(token)
-                if 'error' in tokenUser:
-                    return error(tokenUser['error'], 401)
+                user = self.getUserByToken(token)
+                if 'error' in user:
+                    return error(user['error'], 401)
+                
+                if self.moderation.isUserBanned(user['uuid']):
+                    return error('user_banned', 403)
+                if self.moderation.isUserDeleted(user['uuid']):
+                    return error('user_deleted', 403)
 
-                uuidUser = self.getUserByUUID(uuid)
-                if self.checkPermissions(tokenUser, uuidUser, [PERMISSIONS.ADMIN]):
+                target = self.getUserByUUID(uuid)
+                if self.checkPermissions(user, target, [PERMISSIONS.ADMIN]):
                     return error('unauthorized', 403)
+                
+                if self.moderation.isUserBanned(uuid):
+                    return error('target_user_banned', 403)
+                if self.moderation.isUserDeleted(uuid):
+                    return error('target_user_deleted', 403)
 
                 selfanalytics.increment("actions_per_day")
                 self.save_db()
@@ -240,14 +460,14 @@ class Api:
                 if not token:
                     return error('no_token_provided', 401)
 
-                tokenUser = self.getUserByToken(token)
-                if 'error' in tokenUser:
-                    return error(tokenUser['error'], 401)
-                
+                user = self.getUserByToken(token)
+                if 'error' in user:
+                    return error(user['error'], 401)
+
                 self.analytics.increment("actions_per_day")
                 self.save_db()
 
-                return result(self.user_tree(tokenUser, self.getCredentials(tokenUser['uuid'])), 200)
+                return result(self.user_tree(user, self.getCredentials(user['uuid'])), 200)
             return self.ratelimit.request(_)
 
         # Get actions of user by token
@@ -261,22 +481,32 @@ class Api:
                 if not self.userExists(uuid):
                     return error('user_not_found', 404)
 
-                tokenUser = self.getUserByToken(token)
-                if 'error' in tokenUser:
-                    return error(tokenUser['error'], 401)
+                user = self.getUserByToken(token)
+                if 'error' in user:
+                    return error(user['error'], 401)
+                
+                if self.moderation.isUserBanned(user['uuid']):
+                    return error('user_banned', 403)
+                if self.moderation.isUserDeleted(user['uuid']):
+                    return error('user_deleted', 403)
 
-                uuidUser = self.getUserByUUID(uuid)
-                if tokenUser != uuidUser and PERMISSIONS.ADMIN not in tokenUser["permissions"]:
+                target = self.getUserByUUID(uuid)
+                if user != target and PERMISSIONS.ADMIN not in user["permissions"]:
                     return jsonify({"error": "Unauthorized"}), 403
+                
+                if self.moderation.isUserBanned(uuid):
+                    return error('target_user_banned', 403)
+                if self.moderation.isUserDeleted(uuid):
+                    return error('target_user_deleted', 403)
 
                 actions = self.get_actions(uuid)
 
-                if tokenUser['uuid'] != uuid:
+                if user['uuid'] != uuid:
                     self.append_action(uuid, "get_actions", {
-                        "by": tokenUser["uuid"],
+                        "by": user["uuid"],
                         "ip": request.remote_addr,
                     })
-                self.append_action(tokenUser["uuid"], "get_actions", {
+                self.append_action(user["uuid"], "get_actions", {
                     "of": uuid,
                     "ip": request.remote_addr,
                 })
@@ -291,10 +521,11 @@ class Api:
         @app.route(self.get_uri("actions/<uuid>"), methods=["POST"])
         def appendAction(uuid):
             def _():
-                data = checkJson([[{"value": "action", "type": str}, {"value": "data", "type": dict}]])
+                data = checkJson(
+                    [[{"value": "action", "type": str}, {"value": "data", "type": dict}]])
                 if 'error' in data:
                     return error(data['error'])
-                
+
                 token = request.headers.get("Authorization")
                 if not token:
                     return error('no_token_provided', 401)
@@ -302,13 +533,23 @@ class Api:
                 if not self.userExists(uuid):
                     return error('user_not_found', 404)
 
-                tokenUser = self.getUserByToken(token)
-                if 'error' in tokenUser:
-                    return error(tokenUser['error'], 401)
+                user = self.getUserByToken(token)
+                if 'error' in user:
+                    return error(user['error'], 401)
+                
+                if self.moderation.isUserBanned(user['uuid']):
+                    return error('user_banned', 403)
+                if self.moderation.isUserDeleted(user['uuid']):
+                    return error('user_deleted', 403)
 
-                uuidUser = self.getUserByUUID(uuid)
-                if self.checkPermissions(tokenUser, uuidUser, [PERMISSIONS.ADMIN]):
+                target = self.getUserByUUID(uuid)
+                if self.checkPermissions(user, target, [PERMISSIONS.ADMIN]):
                     return jsonify({"error": "Unauthorized"}), 403
+                
+                if self.moderation.isUserBanned(uuid):
+                    return error('target_user_banned', 403)
+                if self.moderation.isUserDeleted(uuid):
+                    return error('target_user_deleted', 403)
 
                 self.append_action(uuid, data["action"], data["data"])
                 self.analytics.increment("actions_per_day")
@@ -324,38 +565,48 @@ class Api:
                 data = checkJson([[{"value": "permission", "type": int}]])
                 if 'error' in data:
                     return error(data['error'])
-                
+
                 if not self.ckeckIfPermissionExists(data["permission"]):
                     return error('permission_not_found', 404)
-                
+
                 token = request.headers.get("Authorization")
                 if not token:
                     return error('no_token_provided', 401)
 
                 if not self.userExists(uuid):
                     return error('user_not_found', 404)
+
+                user = self.getUserByToken(token)
+                if 'error' in user:
+                    return error(user['error'], 401)
                 
-                tokenUser = self.getUserByToken(token)
-                if 'error' in tokenUser:
-                    return error(tokenUser['error'], 401)
+                if self.moderation.isUserBanned(user['uuid']):
+                    return error('user_banned', 403)
+                if self.moderation.isUserDeleted(user['uuid']):
+                    return error('user_deleted', 403)
 
-                uuidUser = self.data["users"][uuid]
-                if not self.checkPermissions(tokenUser, uuidUser, [PERMISSIONS.ADMIN], True):
+                target = self.data["users"][uuid]
+                if not self.checkPermissions(user, target, [PERMISSIONS.ADMIN], True):
                     return error('unauthorized', 403)
+                
+                if self.moderation.isUserBanned(uuid):
+                    return error('target_user_banned', 403)
+                if self.moderation.isUserDeleted(uuid):
+                    return error('target_user_deleted', 403)
 
-                if data["permission"] in uuidUser["permissions"]:
+                if data["permission"] in target["permissions"]:
                     return error('permission_already_exists', 400)
 
-                uuidUser["permissions"].append(data["permission"])
-                self.update_user(uuidUser)
+                target["permissions"].append(data["permission"])
+                self.update_user(target)
 
-                if tokenUser['uuid'] != uuid:
+                if user['uuid'] != uuid:
                     self.append_action(uuid, "add_permission", {
-                        "by": tokenUser["uuid"],
+                        "by": user["uuid"],
                         "permission": data["permission"],
                         "ip": request.remote_addr,
                     })
-                self.append_action(tokenUser["uuid"], "add_permission", {
+                self.append_action(user["uuid"], "add_permission", {
                     "of": uuid,
                     "permission": data["permission"],
                     "ip": request.remote_addr,
@@ -374,10 +625,10 @@ class Api:
                 data = checkJson([[{"value": "permission", "type": int}]])
                 if 'error' in data:
                     return error(data['error'])
-                
+
                 if not self.ckeckIfPermissionExists(data["permission"]):
                     return error('permission_not_found', 404)
-                
+
                 token = request.headers.get("Authorization")
                 if not token:
                     return error('no_token_provided', 401)
@@ -385,30 +636,40 @@ class Api:
                 if not self.userExists(uuid):
                     return error('user_not_found', 404)
 
-                tokenUser = self.getUserByToken(token)
-                if 'error' in tokenUser:
-                    return error(tokenUser['error'], 401)
-
-                uuidUser = self.data["users"][uuid]
-                if self.checkPermissions(tokenUser, uuidUser, [PERMISSIONS.ADMIN], True):
-                    return error('unauthorized', 403)
-
-                if data["permission"] not in uuidUser["permissions"]:
-                    return error('permission_not_found', 404)
+                user = self.getUserByToken(token)
+                if 'error' in user:
+                    return error(user['error'], 401)
                 
-                if len(uuidUser["permissions"]) == 1:
+                if self.moderation.isUserBanned(user['uuid']):
+                    return error('user_banned', 403)
+                if self.moderation.isUserDeleted(user['uuid']):
+                    return error('user_deleted', 403)
+
+                target = self.data["users"][uuid]
+                if not self.checkPermissions(user, target, [PERMISSIONS.ADMIN], True):
+                    return error('unauthorized', 403)
+                
+                if self.moderation.isUserBanned(uuid):
+                    return error('target_user_banned', 403)
+                if self.moderation.isUserDeleted(uuid):
+                    return error('target_user_deleted', 403)
+
+                if data["permission"] not in target["permissions"]:
+                    return error('permission_not_found', 404)
+
+                if len(target["permissions"]) == 1:
                     return error('last_permission', 400)
 
-                uuidUser["permissions"].remove(data["permission"])
-                self.update_user(uuidUser)
+                target["permissions"].remove(data["permission"])
+                self.update_user(target)
 
-                if tokenUser['uuid'] != uuid:
+                if user['uuid'] != uuid:
                     self.append_action(uuid, "remove_permission", {
-                        "by": tokenUser["uuid"],
+                        "by": user["uuid"],
                         "permission": data["permission"],
                         "ip": request.remote_addr,
                     })
-                self.append_action(tokenUser["uuid"], "remove_permission", {
+                self.append_action(user["uuid"], "remove_permission", {
                     "of": uuid,
                     "permission": data["permission"],
                     "ip": request.remote_addr,
@@ -427,7 +688,7 @@ class Api:
                 data = checkJson([[{"value": "password", "type": str}]])
                 if 'error' in data:
                     return error(data['error'])
-                
+
                 token = request.headers.get("Authorization")
                 if not token:
                     return error('no_token_provided', 401)
@@ -435,13 +696,23 @@ class Api:
                 if not self.userExists(uuid):
                     return error('user_not_found', 404)
 
-                tokenUser = self.getUserByToken(token)
-                if 'error' in tokenUser:
-                    return error(tokenUser['error'], 401)
+                user = self.getUserByToken(token)
+                if 'error' in user:
+                    return error(user['error'], 401)
+                
+                if self.moderation.isUserBanned(user['uuid']):
+                    return error('user_banned', 403)
+                if self.moderation.isUserDeleted(user['uuid']):
+                    return error('user_deleted', 403)
 
-                uuidUser = self.data["users"][uuid]
-                if not self.checkPermissions(tokenUser, uuidUser, [PERMISSIONS.ADMIN], True):
+                target = self.data["users"][uuid]
+                if not self.checkPermissions(user, target, [PERMISSIONS.ADMIN], True):
                     return error('unauthorized', 403)
+                
+                if self.moderation.isUserBanned(uuid):
+                    return error('target_user_banned', 403)
+                if self.moderation.isUserDeleted(uuid):
+                    return error('target_user_deleted', 403)
 
                 token_data = self.generate_credentials(uuid, data["password"])
                 cred = self.data["credentials"][uuid]
@@ -450,12 +721,12 @@ class Api:
                 cred["salt"] = token_data["salt"]
                 self.update_credentials(cred)
 
-                if tokenUser['uuid'] != uuid:
+                if user['uuid'] != uuid:
                     self.append_action(uuid, "change_password", {
-                        "by": tokenUser["uuid"],
+                        "by": user["uuid"],
                         "ip": request.remote_addr
                     })
-                self.append_action(tokenUser["uuid"], "change_password", {
+                self.append_action(user["uuid"], "change_password", {
                     "of": uuid,
                     "ip": request.remote_addr
                 })
@@ -466,34 +737,109 @@ class Api:
                 return result("Password changed", 200)
             return self.ratelimit.request(_)
 
+        # Create demo account by uuid and name (only admin)
+        @app.route(self.get_uri("demo"), methods=["POST"])
+        def createDemo():
+            def _():
+                data = checkJson([[{"value": "uuid", "type": str}, {"value": "name", "type": str}]])
+                if 'error' in data:
+                    return error(data['error'])
+
+                token = request.headers.get("Authorization")
+                if not token:
+                    return error('no_token_provided', 401)
+
+                user = self.getUserByToken(token)
+                if 'error' in user:
+                    return error(user['error'], 401)
+                
+                if self.moderation.isUserBanned(user['uuid']):
+                    return error('user_banned', 403)
+                if self.moderation.isUserDeleted(user['uuid']):
+                    return error('user_deleted', 403)
+
+                if not self.checkPermissions(user, user, [PERMISSIONS.ADMIN], True):
+                    return error('unauthorized', 403)
+                
+                if self.userExists(data['uuid']):
+                    return error('user_already_exists', 400)
+                
+                target = self.register_user(data['uuid'], data['name'], True)
+                self.data['users'][data['uuid']]['password'] = sha512(target['credentials']['password'].encode()).hexdigest()
+                
+                return result(target, 200)
+            return self.ratelimit.request(_)
+        
+        # Delete demo account by uuid (only admin)
+        @app.route(self.get_uri("demo/<uuid>"), methods=["DELETE"])
+        def deleteDemo(uuid):
+            def _():
+                token = request.headers.get("Authorization")
+                if not token:
+                    return error('no_token_provided', 401)
+
+                if not self.userExists(uuid):
+                    return error('user_not_found', 404)
+
+                user = self.getUserByToken(token)
+                if 'error' in user:
+                    return error(user['error'], 401)
+                
+                if self.moderation.isUserBanned(user['uuid']):
+                    return error('user_banned', 403)
+                if self.moderation.isUserDeleted(user['uuid']):
+                    return error('user_deleted', 403)
+
+                if not self.checkPermissions(user, user, [PERMISSIONS.ADMIN], True):
+                    return error('unauthorized', 403)
+                
+                target = self.data["users"][uuid]
+                if not target["isDemo"]:
+                    return error('not_a_demo', 400)
+
+                self.remove_user(uuid)
+                self.save_db()
+
+                return result("Deleted demo user: " + uuid, 200)
+            return self.ratelimit.request(_)
+        
+        # Get moderation (only admin)
+        @app.route(self.get_uri("moderation"), methods=["GET"])
+        def getModeration():
+            def _():
+                token = request.headers.get("Authorization")
+                if not token:
+                    return error('no_token_provided', 401)
+                
+                user = self.getUserByToken(token)
+                if 'error' in user:
+                    return error(user['error'], 401)
+                
+                if not self.checkPermissions(user, user, [PERMISSIONS.ADMIN]):
+                    return error('unauthorized', 403)
+                
+                if self.moderation.isUserBanned(user['uuid']):
+                    return error('user_banned', 403)
+                if self.moderation.isUserDeleted(user['uuid']):
+                    return error('user_deleted', 403)
+                
+                return result(self.moderation.actions, 200)
+            return self.ratelimit.request(_)
+
         @app.route(self.get_uri(), methods=["GET", "POST", "PUT", "DELETE"])
         @app.route(self.get_uri("<first>"), methods=["GET", "POST", "PUT", "DELETE"])
         @app.route(self.get_uri("<first>/<path:rest>"), methods=["GET", "POST", "PUT", "DELETE"])
         def api(first="", rest=""):
             def _():
-                return jsonify({"message": "UwU Servers User API v1"}), 200
+                return result("UwU Servers User API v1", 200)
             return self.ratelimit.request(_)
-    
-    def banUser(self, uuid, reason):
-        if not self.userExists(uuid):
-            return None
-        
-        user = self.data["users"][uuid]
-        user["moderation"]["banned"]["value"] = True
-        user["moderation"]["banned"]["reason"] = reason
-        user["moderation"]["banned"]["timestamp"] = datetime.now().timestamp()
-        self.update_user(user)
-        
-        lastLoginAction = [ action for action in self.get_actions(uuid)["data"] if action["action"] == "login" ][-1]
-        ip = lastLoginAction["data"]["ip"]
-        self.ratelimit.ban_ip(ip)
-    
+
     def ckeckIfPermissionExists(self, permission):
         return permission in [PERMISSIONS.GUEST, PERMISSIONS.MODERATOR, PERMISSIONS.ADMIN]
-    
+
     def userExists(self, uuid):
         return uuid in self.data["users"]
-    
+
     def checkPermissions(self, user, target, permissions, onlyPermissions=False):
         if not onlyPermissions and user["uuid"] == target["uuid"]:
             return True
@@ -506,17 +852,17 @@ class Api:
         if uuid not in self.data["credentials"]:
             return None
         return self.data["credentials"][uuid]
-    
+
     def getUserByUUID(self, uuid):
         if uuid not in self.data["users"]:
             return None
-        return self.data["users"][uuid]  
+        return self.data["users"][uuid]
 
     def getUserByToken(self, token):
         for cred in self.data["credentials"].values():
             if cred["token"] == token:
                 return self.getUserByUUID(cred["uuid"])
-        return { "error": "invalid_token" }
+        return {"error": "invalid_token" }
 
     def generate_action(self, action, data):
         return {
@@ -536,20 +882,20 @@ class Api:
         actions["data"].append(self.generate_action(action, data))
         actions["data"] = actions["data"][-30:]
         self.update_user_action(actions)
-        
+
     def checkMcAuth(self, data):
         name = self.checkUUIDAndFetchName(data['uuid'])
         if 'error' in name:
             return name['error']
         elif name != data['name']:
-            return { 'error': 'name_mismatch' }
+            return {'error': 'name_mismatch' }
         return name
 
     def checkUUIDAndFetchName(self, uuid):
         response = requests.get(f"{self.check_uuid_uri}{uuid}")
 
         if response.status_code != 200:
-            return { 'error': 'uuid_not_found' }
+            return {'error': 'uuid_not_found' }
 
         html = response.text
         site_name = re.search(
@@ -557,13 +903,13 @@ class Api:
         site_uuid = re.search(r'results_raw_id".+value="([a-f0-9-]+)', html)
 
         if (not site_uuid or site_uuid.group(1) != uuid) or not site_name:
-            return { 'error': 'uuid_not_found' }
+            return {'error': 'uuid_not_found' }
 
         return site_name.group(1)
 
     def get_uri(self, route=""):
         return f"{self.uri}{route}"
-    
+
     def default_data(self):
         return {
             "actions": {},
@@ -620,6 +966,7 @@ class Api:
             return None
 
         user["last_login_timestamp"] = datetime.now().timestamp()
+        user["last_login_ip"] = request.remote_addr
         self.update_user(user)
 
         ip = request.remote_addr
@@ -634,8 +981,8 @@ class Api:
 
         return self.user_tree(user, cred)
 
-    def register_user(self, uuid, name):
-        user = self.generate_user(uuid, name)
+    def register_user(self, uuid, name, isDemo=False):
+        user = self.generate_user(uuid, name, isDemo)
         cred = self.generate_credentials(uuid)
         acti = self.generate_user_action(uuid)
         self.update_user(user)
@@ -669,31 +1016,23 @@ class Api:
             "data": [],
         }
 
-    def generate_user(self, uuid, name):
+    def generate_user(self, uuid, name, isDemo=False):
         return {
             "uuid": uuid,
             "name": name,
+            "isDemo": isDemo,
             "created_timestamp": datetime.now().timestamp(),
             "last_login_timestamp": None,
+            "last_login_ip": request.remote_addr,
+            "registration_ip": request.remote_addr,
             "permissions": [
                 PERMISSIONS.GUEST,
             ],
-            "moderation": {
-                "banned": {
-                    "value": False,
-                    "reason": None,
-                    "timestamp": None,
-                },
-                "deleted": {
-                    "value": False,
-                    "reason": None,
-                    "timestamp": None,    
-                },
-            },
+            "moderation": self.moderation.default(),
             "violations": {
                 "total": 0,
                 "danger": ViolationDangerZones.GOOD,
-                "list": [],  
+                "list": [],
             },
         }
 

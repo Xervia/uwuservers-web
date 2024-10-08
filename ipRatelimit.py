@@ -9,8 +9,8 @@ class ratelimit:
         self.limit = 200
         # self.limit = 3
         
-        self.banned_ips_file = 'banned_ips.txt'
-        self.bypass_ips_file = 'bypass_ips.txt'
+        self.banned_ips_file = './banned_ips.txt'
+        self.bypass_ips_file = './bypass_ips.txt'
         self.bypass_ips = []
         self.banned_ips = []
         
@@ -55,6 +55,8 @@ class ratelimit:
         while True:
             time.sleep(60)
             for ip in self.ipList:
+                if self.ipList[ip] > self.limit * 2:
+                    return self.ban_ip(ip)
                 self.ipList[ip] = 0
     
     def check_ip(self, ip):
